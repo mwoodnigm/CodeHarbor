@@ -192,7 +192,9 @@ def _history_context(*, complete_and_exact: bool, exact_suffix_messages: int = 3
 
 
 @pytest.mark.asyncio
-async def test_chat_agent_records_provider_usage_and_prompt_breakdown() -> None:
+async def test_chat_agent_records_provider_usage_and_prompt_breakdown(monkeypatch) -> None:
+    # 这个用例只验证 usage/上下文恢复，证据门禁的行为在 test_evidence_gate.py 里单独覆盖
+    monkeypatch.setattr(settings, "evidence_gate_mode", "off")
     final = await ChatAgent(model=UsageModel()).run(  # type: ignore[arg-type]
         {"message": "Give me a concise answer."},
         {"tools": {}},
@@ -207,7 +209,9 @@ async def test_chat_agent_records_provider_usage_and_prompt_breakdown() -> None:
 
 
 @pytest.mark.asyncio
-async def test_context_overflow_retries_only_the_failed_model_call() -> None:
+async def test_context_overflow_retries_only_the_failed_model_call(monkeypatch) -> None:
+    # 这个用例只验证 usage/上下文恢复，证据门禁的行为在 test_evidence_gate.py 里单独覆盖
+    monkeypatch.setattr(settings, "evidence_gate_mode", "off")
     model = OverflowThenSuccessModel()
     final = await ChatAgent(model=model).run(  # type: ignore[arg-type]
         {"message": "Continue the task."},

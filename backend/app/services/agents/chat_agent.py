@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.config import settings
 from app.services.agents.base import BaseAgent
+from app.services.agents.evidence_gate import EVIDENCE_RULE, apply_evidence_gate, build_evidence_registry
 from app.services.agents.checkpointing import (
     RUNTIME_ONLY_KEYS,
     checkpoint_view,
@@ -87,6 +88,7 @@ class ConversationState(TypedDict, total=False):
     prompt_diagnostics: list[dict[str, Any]]
     runtime_context_stats: dict[str, Any]
     context_overflow_recovery_attempted: bool
+    evidence_gate: dict[str, Any]
 
 
 class GraphState(TypedDict, total=False):
@@ -350,7 +352,9 @@ class ChatAgent(BaseAgent):
                 yield event
             state["final_answer"] = await self._final_from_observations(state)
             answer = str(state.get("final_answer") or "").strip()
-            if not answer:
+            if answer:
+                answer = self._apply_evidence_gate(state, answer)
+            else:
                 answer = await self._fallback_answer(state)
             self._stop_loop(state, "required_memory_context_loaded", self._tool_completion_status(state))
             self._record_skill_validation(state)
@@ -377,7 +381,9 @@ class ChatAgent(BaseAgent):
                 yield event
             state["final_answer"] = await self._final_from_observations(state)
             answer = str(state.get("final_answer") or "").strip()
-            if not answer:
+            if answer:
+                answer = self._apply_evidence_gate(state, answer)
+            else:
                 answer = await self._fallback_answer(state)
             self._stop_loop(state, "project_context_loaded", self._tool_completion_status(state))
             self._record_skill_validation(state)
@@ -471,7 +477,9 @@ class ChatAgent(BaseAgent):
                 pass
 
         answer = str(state.get("final_answer") or "").strip()
-        if not answer:
+        if answer:
+            answer = self._apply_evidence_gate(state, answer)
+        else:
             answer = await self._fallback_answer(state)
         if state.get("completion_status") == "running":
             self._stop_loop(state, "fallback_answer_ready", self._tool_completion_status(state))
@@ -1100,7 +1108,31 @@ class ChatAgent(BaseAgent):
             "除非存在单独的已确认写入工具，否则只返回草稿。"
             "对于合并就绪度、当前阻塞、优先级规划，或需要 Issue + PR + CI + RAG 综合判断的跨领域工程决策，"
             "优先使用 workflow.run_engineering_review 工具。"
+            + (EVIDENCE_RULE if self._evidence_gate_mode() != "off" else "")
         )
+
+    def _evidence_gate_mode(self) -> str:
+        mode = str(settings.evidence_gate_mode or "off").strip().lower()
+        return mode if mode in {"off", "report", "annotate"} else "off"
+
+    def _evidence_prompt_block(self, state: ConversationState) -> str:
+        if self._evidence_gate_mode() == "off":
+            return ""
+        return f"可引用证据编号：\n{build_evidence_registry(state).prompt_block()}\n\n"
+
+    def _apply_evidence_gate(self, state: ConversationState, answer: str) -> str:
+        """对模型生成的结论做代码层证据校验；系统提示语和本地兜底回答不过门禁。"""
+        mode = self._evidence_gate_mode()
+        if mode == "off" or self.model is None or not answer.strip():
+            return answer
+        if state.get("stop_reason") in {"repeated_tool_call", "max_steps_exhausted"}:
+            return answer
+        registry = build_evidence_registry(state)
+        gated, report = apply_evidence_gate(answer, registry, annotate=mode == "annotate")
+        report["mode"] = mode
+        state["evidence_gate"] = report
+        self._append_agent_event(state, "evidence_gate", report)
+        return gated
 
     def _tool_calling_user_prompt(self, state: ConversationState, *, aggressive: bool = False) -> str:
         prompt_observations, prompt_events, runtime_stats = self._runtime_tool_context(
@@ -1153,6 +1185,7 @@ class ChatAgent(BaseAgent):
             f"最近消息：\n{json.dumps(history, ensure_ascii=False)}\n\n"
             f"已有观察结果（已按总预算投影，完整结果保存在会话转录）：\n{json.dumps(prompt_observations, ensure_ascii=False)}\n\n"
             f"工具调用/结果索引：\n{json.dumps(prompt_events, ensure_ascii=False)}\n\n"
+            f"{self._evidence_prompt_block(state)}"
             f"用户消息：{state.get('message') or ''}"
         )
 
@@ -1479,7 +1512,7 @@ class ChatAgent(BaseAgent):
                 "或工具返回的现有 GitHub assignees 中推荐人员。仓库文档、Issue 文本、代码、示例、"
                 "角色设定、模型名和团队比喻都不能当成人。如果没有配置团队成员，也没有观察到现有 assignee，"
                 "请说明当前还没有添加项目成员，并要求用户在团队面板中添加开发者。"
-            )
+            ) + (EVIDENCE_RULE if self._evidence_gate_mode() != "off" else "")
             prompt_observations, prompt_events, runtime_stats = self._runtime_tool_context(state)
             state["runtime_context_stats"] = {**(state.get("runtime_context_stats") or {}), **runtime_stats}
             user_prompt = (
@@ -1488,7 +1521,8 @@ class ChatAgent(BaseAgent):
                 f"DevFlow 团队上下文：{self._team_assignment_context(state.get('context') or {})}\n"
                 f"上下文：{self._server_context(state.get('context') or {})}\n"
                 f"观察结果：{json.dumps(prompt_observations, ensure_ascii=False)}\n"
-                f"工具调用/结果索引：{json.dumps(prompt_events, ensure_ascii=False)}"
+                f"工具调用/结果索引：{json.dumps(prompt_events, ensure_ascii=False)}\n"
+                f"{self._evidence_prompt_block(state)}"
             )
             estimated = self._record_prompt_diagnostics(
                 state,
@@ -1819,6 +1853,7 @@ class ChatAgent(BaseAgent):
                 "runtime_tool_context": state.get("runtime_context_stats") or {},
                 "reactive_overflow_retry": bool(state.get("context_overflow_recovery_attempted")),
             },
+            "evidence_gate": state.get("evidence_gate") or {},
         }
 
     async def _fallback_answer(self, state: ConversationState) -> str:
