@@ -1603,6 +1603,19 @@ async def _conversation_plan_execute_sse(payload: ChatPlanExecuteRequest, db: Se
         )
 
 
+def _resumed_user_message(db: Session, conversation_id: uuid.UUID, payload: ChatRequest) -> ChatMessage | None:
+    """续跑时复用中断前已经写入的用户消息，避免会话里出现重复提问。"""
+    row = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.conversation_id == conversation_id, ChatMessage.role == "user")
+        .order_by(ChatMessage.created_at.desc())
+        .first()
+    )
+    if row is not None and (row.content or "").strip() == payload.message.strip():
+        return row
+    return None
+
+
 async def _conversation_response(payload: ChatRequest, db: Session) -> dict[str, Any]:
     repo = _repo_or_404(db, payload.repo_id)
     conversation = ensure_conversation(db, repo.id, payload.conversation_id)
@@ -1611,7 +1624,12 @@ async def _conversation_response(payload: ChatRequest, db: Session) -> dict[str,
     if compaction_stats.get("attempted"):
         db.commit()
     message_store = MessageStore(db)
-    user_message = message_store.append(repo_id=repo.id, conversation_id=conversation.id, role="user", content=payload.message)
+    run_id = payload.resume_run_id or uuid.uuid4()
+    if payload.resume_run_id and db.get(AgentRun, payload.resume_run_id) is not None:
+        raise HTTPException(status_code=409, detail="该 run 已经完成，无需续跑")
+    user_message = _resumed_user_message(db, conversation.id, payload) if payload.resume_run_id else None
+    if user_message is None:
+        user_message = message_store.append(repo_id=repo.id, conversation_id=conversation.id, role="user", content=payload.message)
     EvidenceStore(db).rebuild_repo(repo, conversation)
     db.commit()
     assembled = ContextAssembler(db).assemble(repo, conversation, payload.message)
@@ -1627,8 +1645,7 @@ async def _conversation_response(payload: ChatRequest, db: Session) -> dict[str,
         "progressive_compaction": compaction_stats,
     }
     context["tools"] = _build_conversation_tools(repo, conversation, db)
-    result = await ChatAgent().run({"message": payload.message}, context)
-    run_id = uuid.uuid4()
+    result = await ChatAgent().run({"message": payload.message, "checkpoint_thread_id": str(run_id)}, context)
     result["run_id"] = str(run_id)
     result["compression_stats"] = assembled.compression_stats
     result["progressive_compaction"] = compaction_stats
@@ -1675,7 +1692,12 @@ async def _conversation_sse(payload: ChatRequest, db: Session):
     if compaction_stats.get("attempted"):
         db.commit()
     message_store = MessageStore(db)
-    user_message = message_store.append(repo_id=repo.id, conversation_id=conversation.id, role="user", content=payload.message)
+    run_id = payload.resume_run_id or uuid.uuid4()
+    if payload.resume_run_id and db.get(AgentRun, payload.resume_run_id) is not None:
+        raise HTTPException(status_code=409, detail="该 run 已经完成，无需续跑")
+    user_message = _resumed_user_message(db, conversation.id, payload) if payload.resume_run_id else None
+    if user_message is None:
+        user_message = message_store.append(repo_id=repo.id, conversation_id=conversation.id, role="user", content=payload.message)
     EvidenceStore(db).rebuild_repo(repo, conversation)
     db.commit()
     assembled = ContextAssembler(db).assemble(repo, conversation, payload.message)
@@ -1692,9 +1714,10 @@ async def _conversation_sse(payload: ChatRequest, db: Session):
     }
     context["tools"] = _build_conversation_tools(repo, conversation, db)
     try:
-        async for event in ChatAgent().run_stream({"message": payload.message}, context):
+        # 先把 run_id 推给前端：连接中断或服务重启后，带上 resume_run_id 重发即可续跑
+        yield encode_sse({"event": "run_started", "data": {"run_id": str(run_id), "resumed": bool(payload.resume_run_id)}})
+        async for event in ChatAgent().run_stream({"message": payload.message, "checkpoint_thread_id": str(run_id)}, context):
             if event["event"] == "final":
-                run_id = uuid.uuid4()
                 event["data"]["run_id"] = str(run_id)
                 event["data"]["compression_stats"] = assembled.compression_stats
                 event["data"]["progressive_compaction"] = compaction_stats
@@ -1789,6 +1812,8 @@ async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> dict[str,
 
 @router.post("/stream")
 async def chat_stream(payload: ChatRequest, db: Session = Depends(get_db)) -> StreamingResponse:
+    if payload.resume_run_id and db.get(AgentRun, payload.resume_run_id) is not None:
+        raise HTTPException(status_code=409, detail="该 run 已经完成，无需续跑")
     return StreamingResponse(_conversation_sse(payload, db), media_type="text/event-stream")
 
 

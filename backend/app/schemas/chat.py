@@ -8,6 +8,8 @@ class ChatRequest(BaseModel):
     conversation_id: UUID | None = None
     message: str
     context: dict = Field(default_factory=dict)
+    # 断点续跑：传入上次中断的 run_id，Agent 从最后一个 checkpoint 继续，不重复执行已完成的工具
+    resume_run_id: UUID | None = None
 
 
 class ChatPlanExecuteRequest(ChatRequest):

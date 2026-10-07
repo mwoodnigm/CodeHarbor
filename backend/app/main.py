@@ -82,6 +82,12 @@ def create_app() -> FastAPI:
     async def health() -> dict[str, str]:
         return {"status": "ok", "app": settings.app_name}
 
+    @app.on_event("shutdown")
+    async def close_agent_checkpointer() -> None:
+        from app.services.agents.checkpointing import close_checkpointer
+
+        await close_checkpointer()
+
     @app.on_event("startup")
     async def create_demo_tables() -> None:
         # 课程项目默认自动建表；生产风格流程会在后续加入 Alembic 迁移。

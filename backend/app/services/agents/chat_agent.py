@@ -11,6 +11,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.config import settings
 from app.services.agents.base import BaseAgent
+from app.services.agents.checkpointing import (
+    RUNTIME_ONLY_KEYS,
+    checkpoint_view,
+    get_checkpointer,
+    state_size_stats,
+)
 from app.services.context_compression import (
     calculate_context_pressure,
     clip_to_token_budget,
@@ -70,6 +76,32 @@ class ConversationState(TypedDict, total=False):
     citations: list[dict[str, Any]]
     pending_tool_calls: list[dict[str, Any]]
     stream_events: list[dict[str, Any]]
+    route: str
+    step: int
+    final_answer: str
+    stop_reason: str
+    completion_status: str
+    tool_call_counts: dict[str, int]
+    evaluation_trace: dict[str, Any]
+    model_usage: list[dict[str, Any]]
+    prompt_diagnostics: list[dict[str, Any]]
+    runtime_context_stats: dict[str, Any]
+    context_overflow_recovery_attempted: bool
+
+
+class GraphState(TypedDict, total=False):
+    """LangGraph 实际保存的状态：只含可序列化的循环进度。
+
+    tools / context / tool_name_map 由请求重建后在节点外层注入；stream_events 通过运行时缓冲区
+    推给前端。这样 checkpoint 既能被持久化，又不会把证据原文和历史消息重复存一遍。
+    """
+
+    message: str
+    observations: list[dict[str, Any]]
+    agent_events: list[dict[str, Any]]
+    tool_calls: list[dict[str, Any]]
+    citations: list[dict[str, Any]]
+    pending_tool_calls: list[dict[str, Any]]
     route: str
     step: int
     final_answer: str
@@ -179,6 +211,39 @@ class ChatAgent(BaseAgent):
             "runtime_context_stats": {},
             "context_overflow_recovery_attempted": False,
         }
+        thread_id = str(input_data.get("checkpoint_thread_id") or "").strip() or None
+        runtime: dict[str, Any] = {
+            "tools": tools,
+            "context": runtime_context,
+            "tool_name_map": state["tool_name_map"],
+            "stream_buffer": [],
+        }
+        if thread_id and self.model is not None:
+            checkpointer = await get_checkpointer()
+            if checkpointer is not None:
+                graph = self._build_agent_graph(self._tool_model(tools), runtime, checkpointer)
+                snapshot = await graph.aget_state(self._graph_config(thread_id))
+                if snapshot is not None and snapshot.next:
+                    # 断点续跑：已完成的工具调用不再执行，从最后一个 checkpoint 的下一个节点继续
+                    state.update(snapshot.values or {})  # type: ignore[typeddict-item]
+                    resume_info = {
+                        "thread_id": thread_id,
+                        "resumed_from_step": int(state.get("step") or 0),
+                        "next_nodes": list(snapshot.next),
+                        "completed_tool_calls": len(state.get("tool_calls") or []),
+                    }
+                    runtime["resume_info"] = resume_info
+                    yield self._event("checkpoint_resumed", resume_info)
+                    async for event in self._finish_graph_run(
+                        graph,
+                        state,
+                        runtime,
+                        thread_id=thread_id,
+                        resume=True,
+                        checkpointer=checkpointer,
+                    ):
+                        yield event
+                    return
         if context.get("evaluation_mode"):
             state["evaluation_trace"] = self._initial_evaluation_trace(message, context)
         self._append_agent_event(
@@ -364,9 +429,46 @@ class ChatAgent(BaseAgent):
             )
             return
 
-        graph = self._build_agent_graph(self._tool_model(tools))
-        async for event in self._stream_agent_graph(graph, state):
+        checkpointer = await get_checkpointer() if thread_id else None
+        graph = self._build_agent_graph(self._tool_model(tools), runtime, checkpointer)
+        async for event in self._finish_graph_run(
+            graph,
+            state,
+            runtime,
+            thread_id=thread_id if checkpointer is not None else None,
+            resume=False,
+            checkpointer=checkpointer,
+        ):
             yield event
+
+    async def _finish_graph_run(
+        self,
+        graph: Any,
+        state: ConversationState,
+        runtime: dict[str, Any],
+        *,
+        thread_id: str | None,
+        resume: bool,
+        checkpointer: Any,
+    ) -> AsyncIterator[dict[str, Any]]:
+        async for event in self._stream_agent_graph(graph, state, runtime, thread_id=thread_id, resume=resume):
+            yield event
+
+        resume_info = runtime.get("resume_info")
+        if resume_info:
+            self._append_agent_event(state, "checkpoint_resumed", resume_info)
+        if checkpointer is not None and thread_id:
+            stats = state_size_stats(dict(state))
+            self._append_agent_event(
+                state,
+                "checkpoint_stats",
+                {"thread_id": thread_id, "backend": type(checkpointer).__name__, **stats},
+            )
+            try:
+                # 跑完就清理，checkpoint 只用于中断恢复，不做长期存档
+                await checkpointer.adelete_thread(thread_id)
+            except Exception:  # pragma: no cover - 清理失败不影响回答
+                pass
 
         answer = str(state.get("final_answer") or "").strip()
         if not answer:
@@ -379,7 +481,7 @@ class ChatAgent(BaseAgent):
         yield self._event(
             "final",
             {
-                "run_id": "",
+                "run_id": thread_id or "",
                 "route": state.get("route") or "direct_answer",
                 "tool_calls": state.get("tool_calls") or [],
                 "agent_events": state.get("agent_events") or [],
@@ -391,14 +493,24 @@ class ChatAgent(BaseAgent):
             },
         )
 
-    def _build_agent_graph(self, tool_model: Any):
+    def _build_agent_graph(self, tool_model: Any, runtime: dict[str, Any], checkpointer: Any = None):
         async def model_decision_node(state: ConversationState) -> dict[str, Any]:
             return await self._graph_model_decision(state, tool_model)
 
-        graph = StateGraph(ConversationState)
-        graph.add_node("model_decision", model_decision_node)
-        graph.add_node("tool_action", self._graph_tool_action)
-        graph.add_node("max_steps_stop", self._graph_max_steps_stop)
+        def with_runtime(node: Callable[[ConversationState], Awaitable[dict[str, Any]]]):
+            async def wrapped(state: GraphState) -> dict[str, Any]:
+                full_state: ConversationState = {**state, **{key: runtime[key] for key in RUNTIME_ONLY_KEYS if key in runtime}}  # type: ignore[misc]
+                result = await node(full_state)
+                events = result.pop("stream_events", None) or []
+                runtime.setdefault("stream_buffer", []).extend(event for event in events if isinstance(event, dict))
+                return result
+
+            return wrapped
+
+        graph = StateGraph(GraphState)
+        graph.add_node("model_decision", with_runtime(model_decision_node))
+        graph.add_node("tool_action", with_runtime(self._graph_tool_action))
+        graph.add_node("max_steps_stop", with_runtime(self._graph_max_steps_stop))
         graph.add_edge(START, "model_decision")
         graph.add_conditional_edges(
             "model_decision",
@@ -411,33 +523,56 @@ class ChatAgent(BaseAgent):
             {"tools": "tool_action", "model": "model_decision", "limit": "max_steps_stop"},
         )
         graph.add_edge("max_steps_stop", END)
-        return graph.compile(name="chat_agent_tool_calling_graph")
+        return graph.compile(name="chat_agent_tool_calling_graph", checkpointer=checkpointer)
 
-    async def _stream_agent_graph(self, graph: Any, state: ConversationState) -> AsyncIterator[dict[str, Any]]:
-        current_state: ConversationState = dict(state)
-        config = {"recursion_limit": self.max_steps * 8 + 20}
-        async for graph_event in graph.astream(current_state, config=config, stream_mode="debug"):
+    def _graph_config(self, thread_id: str | None) -> dict[str, Any]:
+        config: dict[str, Any] = {"recursion_limit": self.max_steps * 8 + 20}
+        if thread_id:
+            config["configurable"] = {"thread_id": thread_id}
+        return config
+
+    async def _stream_agent_graph(
+        self,
+        graph: Any,
+        state: ConversationState,
+        runtime: dict[str, Any],
+        *,
+        thread_id: str | None = None,
+        resume: bool = False,
+    ) -> AsyncIterator[dict[str, Any]]:
+        graph_input: Any = None if resume else checkpoint_view(dict(state))
+        runtime_view = {key: runtime[key] for key in RUNTIME_ONLY_KEYS if key in runtime}
+        # durability="sync"：每一步的 checkpoint 落盘后才进入下一步。默认的 async 模式下，
+        # 进程在工具执行中被杀时，前几步的 checkpoint 可能还没写完（故障演练中实测会退回起点）
+        stream_kwargs: dict[str, Any] = {"config": self._graph_config(thread_id), "stream_mode": "debug"}
+        if thread_id:
+            stream_kwargs["durability"] = "sync"
+        async for graph_event in graph.astream(graph_input, **stream_kwargs):
             if not isinstance(graph_event, dict):
                 continue
             payload = graph_event.get("payload") if isinstance(graph_event.get("payload"), dict) else {}
             node_name = str(payload.get("name") or "")
             if graph_event.get("type") == "task" and node_name == "tool_action":
-                preview = self._preview_tool_use_event(payload.get("input"))
+                raw_input = payload.get("input")
+                preview = self._preview_tool_use_event({**raw_input, **runtime_view} if isinstance(raw_input, dict) else raw_input)
                 if preview:
                     yield self._event("tool_use", preview)
                 continue
             if graph_event.get("type") != "task_result":
                 continue
             result = payload.get("result")
-            if not isinstance(result, dict):
-                continue
-            for key, value in result.items():
-                if key != "stream_events":
-                    current_state[key] = value
-                    state[key] = value
-            for event in result.get("stream_events") or []:
-                if isinstance(event, dict):
-                    yield event
+            if isinstance(result, dict):
+                for key, value in result.items():
+                    state[key] = value  # type: ignore[literal-required]
+            elif isinstance(result, list):
+                # 部分 LangGraph 版本以 [(channel, value), ...] 形式返回写入
+                for item in result:
+                    if isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[0], str):
+                        state[item[0]] = item[1]  # type: ignore[literal-required]
+            buffered = runtime.get("stream_buffer") or []
+            runtime["stream_buffer"] = []
+            for event in buffered:
+                yield event
 
     async def _graph_model_decision(self, state: ConversationState, tool_model: Any) -> dict[str, Any]:
         next_state: ConversationState = dict(state)
