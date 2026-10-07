@@ -539,3 +539,29 @@ class AuditLog(Base):
     request_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class ActionExecution(Base):
+    """外部写操作的幂等执行记录：先落库，再调用 GitHub。
+
+    idempotency_key 唯一索引兜底并发；draft_id 唯一保证一个草稿最多一条执行记录。
+    status: in_progress | succeeded | failed | aborted | unknown | reconciling
+    - aborted：请求确定没有到达 GitHub（熔断、限流、连接失败），草稿退回待确认，可再次执行
+    - unknown：请求可能已被 GitHub 处理（写超时、5xx），下次确认先对账再决定是否重放
+    """
+
+    __tablename__ = "action_executions"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    idempotency_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    draft_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("action_drafts.id", ondelete="CASCADE"), unique=True, index=True)
+    repo_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("repositories.id", ondelete="CASCADE"), index=True)
+    action_type: Mapped[str] = mapped_column(String(100), index=True)
+    target: Mapped[str] = mapped_column(String(300), default="")
+    status: Mapped[str] = mapped_column(String(40), default="in_progress", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=1)
+    result_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

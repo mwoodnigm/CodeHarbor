@@ -26,6 +26,7 @@ type AuditLog = { id: string; action: string; status: string; target_type?: stri
 
 const statusMeta: Record<string, { label: string; className: string }> = {
   pending_confirmation: { label: "等待人工确认", className: "bg-amber-50 text-amber-800 border-amber-200" },
+  executing: { label: "执行中 / 待对账", className: "bg-sky-50 text-sky-700 border-sky-200" },
   executed: { label: "已确认并执行", className: "bg-emerald-50 text-emerald-700 border-emerald-200" },
   cancelled: { label: "已取消", className: "bg-slate-100 text-slate-600 border-slate-200" },
   failed: { label: "执行失败", className: "bg-rose-50 text-rose-700 border-rose-200" }
@@ -140,6 +141,9 @@ export default function ActionDraftsPage() {
                       <button className="inline-flex items-center gap-1 rounded-md bg-teal-600 px-3 py-2 text-sm font-medium text-white transition hover:bg-teal-700 disabled:opacity-60" disabled={loading} onClick={() => changeDraft(draft.id, "confirm")}><Check className="h-4 w-4" />确认执行</button>
                       <button className="inline-flex items-center gap-1 rounded-md border border-line px-3 py-2 text-sm text-slate-600 transition hover:bg-panel disabled:opacity-60" disabled={loading} onClick={() => changeDraft(draft.id, "cancel")}><X className="h-4 w-4" />取消</button>
                     </div>
+                  )}
+                  {draft.status === "executing" && draft.error_message && (
+                    <button className="inline-flex items-center gap-1 rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-sm font-medium text-sky-700 transition hover:bg-sky-100 disabled:opacity-60" disabled={loading} onClick={() => changeDraft(draft.id, "confirm")}><Check className="h-4 w-4" />对账并完成</button>
                   )}
                 </div>
                 <div className="mt-4 whitespace-pre-wrap rounded-md border-l-4 border-teal-500 bg-panel px-4 py-3 text-sm leading-7 text-slate-700">{draft.content}</div>
