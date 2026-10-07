@@ -12,6 +12,23 @@ class Settings(BaseSettings):
 
     github_token: str | None = None
     github_api_base_url: str = "https://api.github.com"
+    # GitHub API 容错：读写分离超时、指数退避、主动限速、熔断
+    github_read_timeout_seconds: float = 15.0
+    github_write_timeout_seconds: float = 30.0
+    github_max_retries: int = 3
+    github_backoff_base_seconds: float = 0.5
+    github_backoff_max_seconds: float = 8.0
+    github_rate_limit_min_remaining: int = 5
+    github_rate_limit_max_wait_seconds: float = 60.0
+    github_breaker_failure_threshold: int = 5
+    github_breaker_reset_seconds: float = 30.0
+    # 外部写操作幂等：执行中记录超过该秒数视为进程中断，允许对账后恢复
+    action_execution_stale_seconds: float = 120.0
+    # Agent 断点续跑：none | memory | postgres
+    agent_checkpoint_backend: str = "memory"
+    agent_checkpoint_database_url: str | None = None
+    # 证据门禁：off | report | annotate
+    evidence_gate_mode: str = "annotate"
 
     llm_api_key: str | None = None
     llm_base_url: str = "https://api.deepseek.com"
