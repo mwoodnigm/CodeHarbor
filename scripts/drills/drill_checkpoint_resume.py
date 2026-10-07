@@ -95,4 +95,8 @@ async def main(phase: str) -> None:
 if __name__ == "__main__":
     if len(sys.argv) != 2 or sys.argv[1] not in {"crash", "resume"}:
         raise SystemExit("usage: drill_checkpoint_resume.py crash|resume")
+    if sys.platform == "win32":
+        # Psycopg async connections require SelectorEventLoop on Windows.
+        # Keep this policy local to the drill; the app also runs MCP subprocesses.
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main(sys.argv[1]))
